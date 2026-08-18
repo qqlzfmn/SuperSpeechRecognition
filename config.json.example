@@ -9,6 +9,8 @@
   "silence_db": -45.0,
   "silence_sec": 1.5,
   "max_duration": 60,
+  "vad_threshold": 0.004,
+  "vad_keep_ms": 250,
   "insert_method": "type",
   "max_tokens": 1000,
   "timeout": 240,

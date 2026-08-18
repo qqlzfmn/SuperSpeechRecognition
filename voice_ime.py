@@ -20,10 +20,20 @@ macOS 语音输入法（无 GUI，全局热键触发）
 
 依赖: pyobjc-framework-AVFoundation / Quartz / CoreAudio / Cocoa（见 requirements.txt）
 权限: 麦克风 + 辅助功能（系统设置 → 隐私与安全性），授予你的终端 App。
+
+架构与迁移（目标：原生 macOS App）:
+  本实现 = 纯逻辑层（Python stdlib，无框架依赖）+ 薄适配层（PyObjC 直绑 Apple 框架）。
+  迁移 Swift 时适配层 1:1 映射同名框架 API，逻辑层机械翻译即可：
+    - 录音/分段: AVAudioRecorder + metering → Swift AVAudioEngine tap（API 同名）
+    - 热键: Quartz CGEventTap（flagsChanged）→ Swift CGEventTap
+    - 文本输入: Quartz CGEvent / NSPasteboard → Swift 同名 API
+  纪律：框架调用只允许出现在标记「# ADAPTER」的方法内；逻辑层保持纯 stdlib，
+        不引入 numpy/requests 等第三方依赖，保证 VAD/状态机/队列可直接翻译。
 """
 
 import argparse
 import base64
+import collections
 import json
 import os
 import subprocess
@@ -55,6 +65,8 @@ DEFAULTS = {
     "silence_db": -45.0,      # 低于该音量视为静音（dB，0 最大 -160 最小）
     "silence_sec": 1.5,       # 持续静音多久自动停止
     "max_duration": 60,       # 最长录音秒数
+    "vad_threshold": 0.004,   # 帧 RMS 语音阈值（0-1 满幅，约 -48dBFS；安静语音峰值~0.01 仍可检出）
+    "vad_keep_ms": 250,       # 保留录音所需的最少有声时长（毫秒）
     "insert_method": "type",  # type=模拟键盘输入 | paste=剪贴板粘贴
     "max_tokens": 1000,
     "timeout": 240,
@@ -182,6 +194,11 @@ class VoiceIME:
         self._stop_timer = None       # 松开后的延迟发送计时（给双击留窗口）
         self.free_mode = False        # 自由说话模式
         self.free_exit_evt = threading.Event()
+        self._seg_queue = []          # 自由模式待处理段（切片文件路径，FIFO 保序）
+        self._seg_lock = threading.Lock()
+        self._seg_cv = threading.Condition(self._seg_lock)
+        self._seg_busy = False        # 分发线程是否正在处理某段
+        self._seg_done = False        # 自由会话是否已结束（无更多段入队）
         self._hot_down = False        # 触发键当前是否处于按下（防重复上报误判）
         self._tap = None
         self._source = None
@@ -263,10 +280,17 @@ class VoiceIME:
             self.stop_evt.set()
 
     def _enter_free_mode(self):
+        if self.free_mode:
+            return
+        with self._seg_lock:
+            if self._seg_busy or self._seg_queue:
+                log("自由模式正在退出，请稍候再进入")
+                return
         self.cancel_evt.clear()
         self.stop_evt.clear()
-        self.free_mode = True
+        self._seg_done = False
         self.free_exit_evt.clear()
+        self.free_mode = True
         gen = self._bump()
         threading.Thread(target=self._free_worker, args=(gen,), daemon=True).start()
 
@@ -300,7 +324,7 @@ class VoiceIME:
         t = threading.Thread(target=self._record_worker, args=(str(path), gen), daemon=True)
         t.start()
 
-    def _record_to(self, path, stop_evt, use_silence=True):
+    def _record_to(self, path, stop_evt, use_silence=True):  # ADAPTER（AVAudioRecorder）
         """录一段音频到 path；stop_evt 置位/静音(可选)/超时则停止。返回 (ok: bool|None, duration_sec)
         objc.autorelease_pool 确保 recorder 对象在函数返回时立即销毁、及时释放麦克风，
         避免上一次录音的输入设备被延迟释放导致下一次录音抓到静音。"""
@@ -373,36 +397,218 @@ class VoiceIME:
         play_sound("stop")
         self._process(path, gen)
 
-    def _free_worker(self, gen):
-        """自由说话模式：连续听写，停顿自动发送一段；连按两下退出"""
+    def _free_worker(self, gen):  # ADAPTER（AVAudioRecorder 会话录音 + VAD 分段）
+        """自由说话模式：单 recorder 连续收音（麦克风只获取一次），
+        VAD 按静音分段，段切片并行发送，连按两下退出。"""
+        import objc
+        from AVFoundation import AVAudioRecorder
+        from Foundation import NSNumber, NSURL
+        from CoreAudio import kAudioFormatLinearPCM
+
         play_sound("start")
-        log("● 自由说话模式：直接说话，停顿自动发送；再连按两下退出")
+        log("● 自由说话模式：连续收音，停顿自动分段发送；再连按两下退出")
+        sess_path = self.tmp_dir / f"voice_ime_free_session_{int(time.time() * 1000)}.wav"
+        settings = {
+            "AVFormatIDKey": NSNumber(unsignedInt=kAudioFormatLinearPCM),
+            "AVSampleRateKey": NSNumber(float=float(self.cfg["sample_rate"])),
+            "AVNumberOfChannelsKey": NSNumber(int=1),
+            "AVLinearPCMBitDepthKey": NSNumber(int=16),
+            "AVLinearPCMIsBigEndianKey": NSNumber(bool=False),
+            "AVLinearPCMIsFloatKey": NSNumber(bool=False),
+        }
+        threading.Thread(target=self._dispatch_loop, daemon=True).start()
+        with objc.autorelease_pool():
+            res = AVAudioRecorder.alloc().initWithURL_settings_error_(
+                NSURL.fileURLWithPath_(str(sess_path)), settings, None)
+            rec = res[0] if isinstance(res, tuple) else res
+            if rec is None or not rec.record():
+                play_sound("error")
+                log("✗ 无法录音（请检查 系统设置 → 隐私与安全性 → 麦克风）")
+                self._cleanup(str(sess_path))
+                with self._seg_lock:
+                    self._seg_done = True
+                self.free_mode = False
+                self._set_state("idle", gen)
+                return
+            rec.setMeteringEnabled_(True)
+            meter_db = self._calibrate_ambient(rec)  # 初始环境标定
+            vad_thr = max(10 ** (meter_db / 20.0) * 2.5, 0.003)
+            vad_thr = min(vad_thr, 0.01)  # 上限，避免环境嘈杂时阈值过高漏掉安静语音
+            log(f"… 环境标定完成（底噪 {meter_db:.1f}dB）")
+            sess_start = time.time()
+            seg_start = None    # 当前段起点（语音出现时记录）
+            last_speech = None  # 最近一次检测到语音的时间
+            noise_win = collections.deque(maxlen=100)  # 10s 噪声跟踪窗口
+            noise_db = meter_db
+            silence_db = max(noise_db + 5.0, -55.0)   # 静音阈值 = 噪声上沿 + 5dB
+            try:
+                while not self.free_exit_evt.is_set():
+                    time.sleep(0.1)
+                    rec.updateMeters()
+                    power = rec.averagePowerForChannel_(0)
+                    now = time.time() - sess_start
+                    if power is None:
+                        continue
+                    # 自适应噪声跟踪：每 10s 用窗口 p25 更新噪声底（抗时变噪声）
+                    noise_win.append(power)
+                    if len(noise_win) >= 100:
+                        s = sorted(noise_win)
+                        noise_db = s[len(s) // 4]
+                        silence_db = max(noise_db + 5.0, -55.0)
+                        noise_win.clear()
+                    if power > silence_db:
+                        if seg_start is None:
+                            seg_start = now
+                        last_speech = now
+                    elif seg_start is not None and now - last_speech >= float(self.cfg["silence_sec"]):
+                        self._enqueue_segment(str(sess_path), seg_start, last_speech + 0.3, gen, vad_thr)
+                        seg_start = None
+                    if now >= float(self.cfg["max_duration"]):
+                        log("自由说话模式达到最长时长，自动退出")
+                        break
+            finally:
+                rec.stop()
+        # 收尾：最后一段 + 标记分发结束 + 等待队列清空
+        if seg_start is not None and last_speech is not None:
+            self._enqueue_segment(str(sess_path), seg_start, last_speech + 0.3, gen, vad_thr)
+        with self._seg_lock:
+            self._seg_done = True
+            self._seg_cv.notify_all()
+        self._finish_free(gen, str(sess_path))
+
+    def _calibrate_ambient(self, rec):  # ADAPTER（AVAudioRecorder metering）
+        """0.5s 环境标定：取 metering 的 75% 分位作为底噪（dB）。
+        用噪声上沿而非均值/低分位，避免瞬时数字静音（-120）拉低阈值导致分段失效"""
+        powers = []
+        t0 = time.time()
+        while time.time() - t0 < 0.5:
+            rec.updateMeters()
+            p = rec.averagePowerForChannel_(0)
+            if p is not None:
+                powers.append(p)
+            time.sleep(0.05)
+        if not powers:
+            return -50.0
+        powers.sort()
+        idx = min(len(powers) - 1, max(0, int(len(powers) * 0.75)))
+        return max(min(powers[idx], -30.0), -80.0)
+
+    def _slice_wav(self, src, t0, t1, dst):
+        """从正在写入的会话 wav 切出 [t0, t1] 秒的 PCM 并写成独立 wav。成功返回 True"""
+        import struct
+        sr = int(self.cfg["sample_rate"])
         try:
-            while not self.free_exit_evt.is_set():
-                if not self._set_state("recording", gen):
-                    return
-                path = self.tmp_dir / f"voice_ime_free_{int(time.time() * 1000)}.wav"
-                ok, dur = self._record_to(str(path), self.stop_evt)
-                if ok is None:
-                    play_sound("error")
-                    log("✗ 无法录音（请检查 系统设置 → 隐私与安全性 → 麦克风）")
+            with open(src, "rb") as f:
+                hdr = f.read(12)
+                if hdr[:4] != b"RIFF" or hdr[8:12] != b"WAVE":
+                    return False
+                data_off = None
+                while True:  # 扫描 chunk 定位 data 区
+                    cid = f.read(4)
+                    if len(cid) < 4:
+                        break
+                    csize = struct.unpack("<I", f.read(4))[0]
+                    if cid == b"data":
+                        data_off = f.tell()
+                        break
+                    f.seek(csize + (csize & 1), 1)
+                if data_off is None:
+                    return False
+                n0 = int(t0 * sr) * 2
+                n1 = int(t1 * sr) * 2
+                if n1 <= n0:
+                    return False
+                want = n1 - n0
+                data = b""
+                for _ in range(6):  # 写入有缓冲，重试补读
+                    f.seek(data_off + n0)
+                    data = f.read(want)
+                    if len(data) >= want:
+                        break
+                    time.sleep(0.2)
+                if len(data) < want:
+                    log("分段读取不完整，已丢弃")
+                    return False
+            with open(dst, "wb") as f:
+                f.write(b"RIFF")
+                f.write(struct.pack("<I", 36 + len(data)))
+                f.write(b"WAVEfmt ")
+                f.write(struct.pack("<IHHIIHH", 16, 1, 1, sr, sr * 2, 2, 16))
+                f.write(b"data")
+                f.write(struct.pack("<I", len(data)))
+                f.write(data)
+            return True
+        except Exception as e:
+            log(f"分段失败: {e}")
+            return False
+
+    def _enqueue_segment(self, sess_path, t0, t1, gen, vad_thr=None):
+        """切片 + VAD 复查 + 入队（FIFO）"""
+        dur = t1 - t0
+        if dur < self.MIN_HOLD_SEC:
+            return
+        slice_path = self.tmp_dir / f"voice_ime_seg_{int(time.time() * 1000)}.wav"
+        if not self._slice_wav(sess_path, t0, t1, str(slice_path)):
+            return
+        if self._is_silent(str(slice_path), vad_thr):
+            self._cleanup(str(slice_path))
+            log("未检测到语音，已跳过")
+            return
+        with self._seg_lock:
+            self._seg_queue.append(str(slice_path))
+            self._seg_cv.notify()
+        log(f"… 分段完成，入队（{dur:.1f}s）")
+
+    def _dispatch_loop(self):
+        """FIFO 顺序处理分段：API + 插入（保序）"""
+        while True:
+            with self._seg_lock:
+                if self._seg_queue:
+                    seg = self._seg_queue.pop(0)
+                elif self._seg_done:
                     break
-                if self.free_exit_evt.is_set():
-                    self._cleanup(str(path))
-                    break
-                if dur < self.MIN_HOLD_SEC:
-                    self._cleanup(str(path))
+                else:
+                    self._seg_cv.wait(timeout=0.5)
                     continue
-                if self._is_silent(str(path)):
-                    self._skip_silent(str(path))
-                    continue
-                play_sound("stop")
-                self._process(str(path), gen)
+            self._seg_busy = True
+            try:
+                self._process_segment(seg)
+            finally:
+                self._seg_busy = False
+
+    def _process_segment(self, path):
+        """自由模式段处理：API + 哨兵过滤 + 插入（不碰主状态机，保序由 FIFO 分发保证）"""
+        log("… 识别并优化中")
+        try:
+            text = self._api_audio(path, self.cfg["system_prompt"])
+            if not text:
+                return
+            if text in ("无语音", "无语音。", "[EMPTY]"):
+                log("未检测到语音，已跳过")
+                return
+            log("✓ " + text)
+            self.insert_text(text)
+            play_sound("done")
+        except Exception as e:
+            play_sound("error")
+            log(f"✗ 处理失败: {e}")
         finally:
-            self.free_mode = False
-            self._set_state("idle", gen)
-            play_sound("stop")
-            log("自由说话模式已退出")
+            self._cleanup(path)
+
+    def _finish_free(self, gen, sess_path):
+        """退出自由模式：等待队列清空（限时 60s），清理会话文件，复位状态"""
+        t0 = time.time()
+        while time.time() - t0 < 60:
+            with self._seg_lock:
+                empty = not self._seg_queue and not self._seg_busy
+            if empty:
+                break
+            time.sleep(0.2)
+        self._cleanup(sess_path)
+        self.free_mode = False
+        self._set_state("idle", gen)
+        play_sound("stop")
+        log("自由说话模式已退出")
 
     # ---------- API 处理 ----------
 
@@ -533,7 +739,7 @@ class VoiceIME:
         else:
             self._insert_type(text)
 
-    def _insert_type(self, text):
+    def _insert_type(self, text):  # ADAPTER（Quartz CGEvent 模拟键盘）
         from Quartz import (CGEventCreateKeyboardEvent, CGEventKeyboardSetUnicodeString,
                             CGEventPost, kCGHIDEventTap)
         for i in range(0, len(text), 50):
@@ -546,7 +752,7 @@ class VoiceIME:
             CGEventPost(kCGHIDEventTap, up)
             time.sleep(0.03)
 
-    def _insert_paste(self, text):
+    def _insert_paste(self, text):  # ADAPTER（AppKit NSPasteboard + Quartz）
         from AppKit import NSPasteboard, NSPasteboardTypeString
         from Quartz import (CGEventCreateKeyboardEvent, CGEventPost, kCGHIDEventTap,
                             kCGEventFlagMaskCommand, CGEventCreate, kCGEventSourceStateHIDSystemState)
@@ -569,7 +775,7 @@ class VoiceIME:
 
     # ---------- 事件监听 ----------
 
-    def _tap_cb(self, proxy, etype, event, refcon):
+    def _tap_cb(self, proxy, etype, event, refcon):  # ADAPTER（Quartz CGEventTap）
         from Quartz import (CGEventGetIntegerValueField, CGEventGetFlags,
                             kCGKeyboardEventKeycode, kCGKeyboardEventAutorepeat)
         if self.cfg.get("log_keys"):
@@ -643,32 +849,48 @@ class VoiceIME:
 
     # ---------- 工具 ----------
 
-    def _is_silent(self, path, peak_threshold=0.005):
-        """本地检测 WAV 是否基本无语音（静音/纯环境音），避免空段发模型产生垃圾回复"""
+    def _wav_voiced_sec(self, path, threshold=None):
+        """返回 (voiced_sec, total_sec)。按 25ms 帧计算 RMS，RMS > threshold 记为有声帧。
+        threshold 为帧 RMS 幅值（0-1），默认取 cfg vad_threshold。失败返回 (0.0, 0.0)"""
         import array
         import wave
         try:
             with wave.open(path, "rb") as w:
+                sr = w.getframerate() or 16000
                 n = w.getnframes()
-                if n < 200:
-                    return True  # 不足 10ms，视为空
+                if n < int(sr * 0.05):
+                    return (0.0, 0.0)  # <50ms
                 frames = w.readframes(n)
             samples = array.array("h")
             samples.frombytes(frames)
             if not samples:
-                return True
-            # 大步采样找峰值（语音峰值通常 >0.05，环境噪声 <0.005）
-            step = max(1, len(samples) // 20000)
-            peak = 0
-            for i in range(0, len(samples), step):
-                a = abs(samples[i])
-                if a > peak:
-                    peak = a
-                    if peak > 1000:
-                        break
-            return peak / 32768.0 < peak_threshold
+                return (0.0, 0.0)
+            threshold = threshold if threshold is not None else float(self.cfg.get("vad_threshold", 0.006))
+            frame_len = max(1, int(sr * 0.025))
+            voiced = 0
+            total = 0
+            i = 0
+            L = len(samples)
+            while i + frame_len // 2 <= L:
+                seg = samples[i:i + frame_len]
+                s = 0.0
+                cnt = 0
+                for v in seg[::4]:  # 抽稀 4 倍估算 RMS，省算力
+                    s += v * v
+                    cnt += 1
+                rms = (s / cnt) ** 0.5 if cnt else 0.0
+                if rms / 32768.0 >= threshold:
+                    voiced += 1
+                total += 1
+                i += frame_len
+            return (voiced * 0.025, total * 0.025)
         except Exception:
-            return False  # 分析失败时放行，避免误删真实内容
+            return (0.0, 0.0)
+
+    def _is_silent(self, path, threshold=None):
+        """帧级 VAD：有声时长 < vad_keep_ms 视为无语音（安静说话也能保留，纯噪声被丢弃）"""
+        voiced, _ = self._wav_voiced_sec(path, threshold)
+        return voiced < float(self.cfg.get("vad_keep_ms", 250)) / 1000.0
 
     def _wav_peak(self, path):
         """读取 wav 峰值（0.0-1.0），失败返回 -1"""
@@ -691,7 +913,8 @@ class VoiceIME:
         """静音段处理：保留/删除文件并记录。返回是否保留文件"""
         keep = bool(self.cfg.get("keep_skipped_audio"))
         if keep:
-            log(f"未检测到语音，已跳过（peak={self._wav_peak(path)}，保留: {path}）")
+            voiced, total = self._wav_voiced_sec(path)
+            log(f"未检测到语音，已跳过（peak={self._wav_peak(path)} voiced={voiced:.2f}s/{total:.1f}s，保留: {path}）")
         else:
             self._cleanup(path)
             log("未检测到语音，已跳过")
@@ -747,7 +970,7 @@ def test_record(cfg):
     test_file(cfg, path)
 
 
-def pick_keycodes():
+def pick_keycodes():  # ADAPTER（Quartz CGEventTap 按键码拾取器）
     """--keys：按下任意键打印其 keycode，用于配置 hotkey（含修饰键）"""
     from Quartz import (CGEventTapCreate, CGEventTapEnable, CGEventTapIsEnabled,
                         kCGHIDEventTap, kCGHeadInsertEventTap,
