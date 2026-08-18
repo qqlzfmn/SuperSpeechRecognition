@@ -1,0 +1,17 @@
+{
+  "base_url": "https://www.dmxapi.cn/v1",
+  "api_key": "sk-在此填入你的APIKEY",
+  "model": "qwen3-omni-flash-all",
+  "hotkey": 54,
+  "trigger": "hold",
+  "cancel_key": "esc",
+  "sample_rate": 16000,
+  "silence_db": -45.0,
+  "silence_sec": 1.5,
+  "max_duration": 60,
+  "insert_method": "type",
+  "max_tokens": 1000,
+  "timeout": 240,
+  "log_keys": false,
+  "keep_skipped_audio": false
+}

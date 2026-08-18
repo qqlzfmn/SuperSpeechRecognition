@@ -1,0 +1,4 @@
+pyobjc-framework-AVFoundation
+pyobjc-framework-Quartz
+pyobjc-framework-CoreAudio
+pyobjc-framework-Cocoa
